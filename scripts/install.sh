@@ -35,15 +35,44 @@ fi
 base_dir_for() {
   case "$1" in
     claude) printf '%s\n' "${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}" ;;
-    codex) printf '%s\n' "${CODEX_SKILLS_DIR:-$HOME/.agents/skills}" ;;
-    tfcode) printf '%s\n' "${TFCODE_SKILLS_DIR:-$HOME/.tfcode/skill}" ;;
+    # This installation discovered gauntlet-loop via ~/.codex/skills.
+    codex) printf '%s\n' "${CODEX_SKILLS_DIR:-$HOME/.codex/skills}" ;;
+    # The TFCode setup used to validate this release reads the Claude skills
+    # directory as its compatibility fallback. TFCODE_SKILLS_DIR remains
+    # available for installations with a documented native directory.
+    tfcode) printf '%s\n' "${TFCODE_SKILLS_DIR:-$HOME/.claude/skills}" ;;
   esac
 }
 
+destination_for() {
+  printf '%s/gauntlet-loop\n' "$(base_dir_for "$1")"
+}
+
+clients_for() {
+  if [ "$1" = "all" ]; then
+    printf '%s\n' claude codex tfcode
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# One entry per unique destination path, even when multiple clients share it
+# (e.g. tfcode's default falls back to the same directory as claude's).
+unique_destinations() {
+  clients_for "$client" | while read -r c; do destination_for "$c"; done | sort -u
+}
+
+clients_at_destination() {
+  target="$1"
+  clients_for "$client" | while read -r c; do
+    if [ "$(destination_for "$c")" = "$target" ]; then
+      printf '%s\n' "$c"
+    fi
+  done
+}
+
 preflight_one() {
-  client_name="$1"
-  base_dir="$(base_dir_for "$client_name")"
-  destination="$base_dir/gauntlet-loop"
+  destination="$1"
 
   if [ -L "$destination" ]; then
     current_target="$(readlink "$destination")"
@@ -61,9 +90,8 @@ preflight_one() {
 }
 
 install_one() {
-  client_name="$1"
-  base_dir="$(base_dir_for "$client_name")"
-  destination="$base_dir/gauntlet-loop"
+  destination="$1"
+  base_dir="$(dirname "$destination")"
   mkdir -p "$base_dir"
 
   if [ -L "$destination" ]; then
@@ -74,20 +102,29 @@ install_one() {
   else
     mkdir "$destination"
     cp "$repo_dir/SKILL.md" "$destination/SKILL.md"
+    cp "$repo_dir/LICENSE" "$destination/LICENSE"
     cp -R "$repo_dir/agents" "$destination/agents"
   fi
 
-  echo "installed for $client_name: $destination ($mode)"
+  clients="$(clients_at_destination "$destination" | paste -sd, -)"
+  echo "installed for $clients: $destination ($mode)"
 }
 
-if [ "$client" = "all" ]; then
-  preflight_one claude
-  preflight_one codex
-  preflight_one tfcode
-  install_one claude
-  install_one codex
-  install_one tfcode
-else
-  preflight_one "$client"
-  install_one "$client"
+# Preflight every destination first and collect every conflict before making
+# any change, so a single conflicting client never leaves the others
+# partially installed.
+conflicts=0
+while IFS= read -r destination; do
+  if ! preflight_one "$destination"; then
+    conflicts=1
+  fi
+done <<< "$(unique_destinations)"
+
+if [ "$conflicts" -ne 0 ]; then
+  echo "error: install aborted, no changes were made" >&2
+  exit 1
 fi
+
+while IFS= read -r destination; do
+  install_one "$destination"
+done <<< "$(unique_destinations)"
