@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gauntlet Loop"
+  short_description: "Build, critique, revise, and verify"
+  default_prompt: "Use $gauntlet-loop to turn this build request into a bounded worker-and-critic prompt."
