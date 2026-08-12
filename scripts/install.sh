@@ -130,3 +130,11 @@ fi
 while IFS= read -r destination; do
   install_one "$destination"
 done <<< "$(unique_destinations)"
+
+if [ "$client" = "all" ] || [ "$client" = "claude" ]; then
+  echo
+  echo "Before running runtime mode ('gauntlet.py run') from inside Claude Code,"
+  echo "allowlist the runner so a mid-loop permission prompt doesn't get read as"
+  echo "a sandbox-evasion attempt by the auto-mode classifier:"
+  echo "  /permissions -> add: Bash(python3 $repo_dir/scripts/gauntlet.py:*)"
+fi

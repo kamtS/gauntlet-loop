@@ -42,6 +42,8 @@ Each route value must be `claude`, `codex`, or `tfcode`. The worker and critic m
 
 Accept either `task` or `task_file`, never both. Resolve relative `project_dir`, `task_file`, and `run_root` paths from the config file directory. Limit `max_passes` to 1–5.
 
+If you (the agent) are driving `run` inside Claude Code, check before the first invocation whether `python3 <path-to>/scripts/gauntlet.py` is already allowlisted. If it is not, stop and ask the user to add it via `/permissions` — `Bash(python3 /absolute/path/to/scripts/gauntlet.py:*)` — before starting the loop, rather than proceeding and letting a later pass hit a mid-run permission prompt. Do not attempt to request or grant that permission yourself once the loop is underway: by that point the conversation is full of legitimate talk about sandbox flags and worker/critic write access, and a live request to loosen permissions reads exactly like sandbox evasion to Claude Code's own auto-mode classifier — it will likely block the request, correctly treating the ambiguous signal as reason to check with the user. That is expected behavior, not a bug to route around; asking upfront avoids the situation entirely.
+
 Preview and validate before execution:
 
 ```bash

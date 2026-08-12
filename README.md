@@ -94,6 +94,8 @@ Copy [the example config](examples/gauntlet.json) and set the project, task, acc
 
 That policy launches TFCode only for criticism. Change `critic` to `claude` or `codex` and TFCode is never invoked. Any phase may use any supported runtime, with two guardrails: worker and critic must differ, and a TFCode worker requires `"allow_tfcode_write": true` because TFCode's non-interactive write mode uses `--auto`.
 
+If you're driving `run` from inside Claude Code itself, allowlist the runner **before** you start, not mid-run: `/permissions`, then add `Bash(python3 /absolute/path/to/scripts/gauntlet.py:*)` scoped to this script. Asking Claude Code to grant that permission for itself, mid-conversation, tends to fail — a conversation about a multi-pass runtime loop discusses sandbox flags and worker/critic permissions by its nature, and Claude Code's own auto-mode permission classifier reads a live request to loosen permissions in that context as a plausible sandbox-evasion attempt and blocks it, even when the request is this narrowly scoped. That's the classifier doing its job on ambiguous signal, not a bug — set the rule up front and it never comes up.
+
 Preview the exact client route and commands, check that its required CLIs are installed, then run:
 
 ```bash
