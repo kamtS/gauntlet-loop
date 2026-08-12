@@ -104,6 +104,8 @@ install_one() {
     cp "$repo_dir/SKILL.md" "$destination/SKILL.md"
     cp "$repo_dir/LICENSE" "$destination/LICENSE"
     cp -R "$repo_dir/agents" "$destination/agents"
+    cp -R "$repo_dir/scripts" "$destination/scripts"
+    cp -R "$repo_dir/examples" "$destination/examples"
   fi
 
   clients="$(clients_at_destination "$destination" | paste -sd, -)"

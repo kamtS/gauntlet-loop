@@ -35,6 +35,13 @@ else
   bad "scripts/validate.sh has invalid shell syntax"
 fi
 
+if PYTHONPYCACHEPREFIX="$tmp_root/pycache" python3 -m py_compile \
+  "$repo_dir/scripts/gauntlet.py" "$repo_dir/scripts/test_gauntlet.py"; then
+  ok "Python runner and tests compile"
+else
+  bad "Python runner or tests have invalid syntax"
+fi
+
 # --- SKILL.md frontmatter ------------------------------------------------
 
 skill_md="$repo_dir/SKILL.md"
@@ -122,8 +129,10 @@ else
   bad "claude copy destination is missing or is a symlink"
 fi
 
-if [ -f "$claude_copy_dest/SKILL.md" ] && [ -f "$claude_copy_dest/LICENSE" ] && [ -d "$claude_copy_dest/agents" ]; then
-  ok "claude copy destination includes SKILL.md, LICENSE, and agents/"
+if [ -f "$claude_copy_dest/SKILL.md" ] && [ -f "$claude_copy_dest/LICENSE" ] &&
+   [ -d "$claude_copy_dest/agents" ] && [ -f "$claude_copy_dest/scripts/gauntlet.py" ] &&
+   [ -f "$claude_copy_dest/examples/gauntlet.json" ]; then
+  ok "claude copy destination includes the skill, license, runner, and example"
 else
   bad "claude copy destination is missing expected files"
 fi
@@ -202,6 +211,12 @@ else
 fi
 
 # --- summary ---------------------------------------------------------------
+
+if python3 "$repo_dir/scripts/test_gauntlet.py"; then
+  ok "cross-runtime routing tests pass"
+else
+  bad "cross-runtime routing tests failed"
+fi
 
 echo
 echo "$pass passed, $fail failed"

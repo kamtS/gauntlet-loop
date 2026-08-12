@@ -1,4 +1,4 @@
 interface:
   display_name: "Gauntlet Loop"
-  short_description: "Build, critique, revise, and verify"
-  default_prompt: "Use $gauntlet-loop to turn this build request into a bounded worker-and-critic prompt."
+  short_description: "Route a bounded build-and-critique loop"
+  default_prompt: "Use $gauntlet-loop to route this task across Claude Code, Codex, and TFCode with an explicit bounded worker-and-critic policy."
