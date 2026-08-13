@@ -1,6 +1,7 @@
 ---
 name: gauntlet-loop
 description: Plan, build, independently critique, revise, and verify substantial work with a bounded loop whose planner, worker, critic, and integrator can each be routed explicitly to Claude Code, Codex, or TFCode. Use when a user asks for a gauntlet loop, cross-runtime orchestration, independent workers and critics, iterative self-critique, or a reusable bounded orchestration prompt.
+license: MIT
 ---
 
 # Gauntlet Loop
