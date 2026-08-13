@@ -104,6 +104,8 @@ install_one() {
     cp "$repo_dir/SKILL.md" "$destination/SKILL.md"
     cp "$repo_dir/LICENSE" "$destination/LICENSE"
     cp -R "$repo_dir/agents" "$destination/agents"
+    cp -R "$repo_dir/scripts" "$destination/scripts"
+    cp -R "$repo_dir/examples" "$destination/examples"
   fi
 
   clients="$(clients_at_destination "$destination" | paste -sd, -)"
@@ -128,3 +130,11 @@ fi
 while IFS= read -r destination; do
   install_one "$destination"
 done <<< "$(unique_destinations)"
+
+if [ "$client" = "all" ] || [ "$client" = "claude" ]; then
+  echo
+  echo "Before running runtime mode ('gauntlet.py run') from inside Claude Code,"
+  echo "allowlist the runner so a mid-loop permission prompt doesn't get read as"
+  echo "a sandbox-evasion attempt by the auto-mode classifier:"
+  echo "  /permissions -> add: Bash(python3 $repo_dir/scripts/gauntlet.py:*)"
+fi

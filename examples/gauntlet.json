@@ -1,0 +1,15 @@
+{
+  "project_dir": "../your-project",
+  "task_file": "TASK.md",
+  "acceptance": "Tests pass, the requested behavior works, and no unrelated files change.",
+  "max_passes": 3,
+  "route": {
+    "planner": "claude",
+    "worker": "codex",
+    "critic": "tfcode",
+    "integrator": "claude"
+  },
+  "models": {
+    "claude": "sonnet"
+  }
+}

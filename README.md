@@ -1,8 +1,8 @@
 # Gauntlet Loop
 
-Gauntlet Loop turns a build brief into a ready-to-run orchestration prompt: independent workers build focused pieces, separate critics try to disprove that each piece is done, and the work is revised until it passes a concrete quality bar or reaches a hard iteration limit.
+Gauntlet Loop routes a bounded build-and-review cycle across Claude Code, Codex, and TFCode: one client plans, another implements, an independent client tries to disprove completion, and the work is revised until it passes a concrete quality bar or reaches a hard iteration limit.
 
-It is one portable [Agent Skill](https://agentskills.io/) that can be installed in Claude Code, Codex, and tfcode. The skill travels between those clients; it does **not** transfer live sessions, state, or tasks between their runtimes. The generated prompt executes only where the host supports agent delegation.
+It is both a portable [Agent Skill](https://agentskills.io/) and a local, auditable CLI orchestrator. The skill can still generate a client-neutral prompt, but runtime mode performs real handoffs through the three installed command-line clients and stores every prompt and response as a run artifact.
 
 ## What it adds
 
@@ -11,6 +11,8 @@ It is one portable [Agent Skill](https://agentskills.io/) that can be installed 
 - Artifact-appropriate verification for code, interfaces, documents, data, and creative work
 - A bounded revision loop that stops and escalates unresolved failures
 - Final integration and end-to-end verification by the orchestrator
+- Explicit per-phase runtime routing: decide exactly when TFCode is and is not used
+- Local handoffs through installed CLIs; no API keys or orchestration service
 
 ## Install
 
@@ -50,7 +52,7 @@ The installer preflights every selected client's destination before making any c
 
 The default `link` mode makes the installed skill a symlink back to this checkout. That means every client using it runs whatever is currently on disk here — a `git pull`, a local edit, or a checkout of a different branch all take effect immediately, for every linked client, with no separate approval step. Only use link mode against a checkout you trust and control.
 
-Pass `--copy` to opt out of that live-update behavior. Copy mode duplicates `SKILL.md`, `LICENSE`, and `agents/` into the destination and does not track this checkout afterward — it stays pinned to whatever was copied until you rerun the installer. Use `--copy` when you want to review and pin a specific version, or when the destination filesystem doesn't support symlinks.
+Pass `--copy` to opt out of that live-update behavior. Copy mode duplicates `SKILL.md`, `LICENSE`, `agents/`, `scripts/`, and `examples/` into the destination and does not track this checkout afterward — it stays pinned to whatever was copied until you rerun the installer. Use `--copy` when you want to review and pin a specific version, or when the destination filesystem doesn't support symlinks.
 
 ### Uninstall
 
@@ -71,21 +73,60 @@ rm -r ~/.codex/skills/gauntlet-loop
 
 Adjust the paths above if you installed with `CLAUDE_SKILLS_DIR`, `CODEX_SKILLS_DIR`, or `TFCODE_SKILLS_DIR` overrides. Removing a shared destination (the tfcode default) uninstalls it for both clients that pointed at it.
 
-## Use
+## Route and run
 
-Invoke the skill named `gauntlet-loop` from your agent host and include the work you want sharpened, for example:
+Copy [the example config](examples/gauntlet.json) and set the project, task, acceptance bar, pass limit, and route:
+
+```json
+{
+  "project_dir": "/path/to/project",
+  "task": "Implement the requested change and prove it works.",
+  "acceptance": "Tests pass and no unrelated files change.",
+  "max_passes": 3,
+  "route": {
+    "planner": "claude",
+    "worker": "codex",
+    "critic": "tfcode",
+    "integrator": "claude"
+  }
+}
+```
+
+That policy launches TFCode only for criticism. Change `critic` to `claude` or `codex` and TFCode is never invoked. Any phase may use any supported runtime, with two guardrails: worker and critic must differ, and a TFCode worker requires `"allow_tfcode_write": true` because TFCode's non-interactive write mode uses `--auto`.
+
+If you're driving `run` from inside Claude Code itself, allowlist the runner **before** you start, not mid-run: `/permissions`, then add `Bash(python3 /absolute/path/to/scripts/gauntlet.py:*)` scoped to this script. Asking Claude Code to grant that permission for itself, mid-conversation, tends to fail — a conversation about a multi-pass runtime loop discusses sandbox flags and worker/critic permissions by its nature, and Claude Code's own auto-mode permission classifier reads a live request to loosen permissions in that context as a plausible sandbox-evasion attempt and blocks it, even when the request is this narrowly scoped. That's the classifier doing its job on ambiguous signal, not a bug — set the rule up front and it never comes up.
+
+Preview the exact client route and commands, check that its required CLIs are installed, then run:
+
+```bash
+python3 scripts/gauntlet.py route gauntlet.json
+python3 scripts/gauntlet.py doctor gauntlet.json
+python3 scripts/gauntlet.py run gauntlet.json
+```
+
+The runner uses no shell interpolation. It invokes each local CLI as a subprocess, gives write permissions only to the worker phase, caps loops at five passes, and stores the config snapshot, phase prompts/responses, verdict, and final integration report under `<project>/.gauntlet/runs/`. Read-only phases are also guarded by a before/after Git-state check.
+
+Binary paths can be overridden with `GAUNTLET_CLAUDE_BIN`, `GAUNTLET_CODEX_BIN`, and `GAUNTLET_TFCODE_BIN`. Optional client models belong in a `models` object keyed by runtime. Relative config paths resolve from the config file's directory.
+
+Client invocations can consume substantial tokens and may incur provider charges. `route` and `doctor` do not invoke a model; `run` does. Review the resolved route before each live run.
+
+## Prompt-only use
+
+Invoke the skill named `gauntlet-loop` from your agent host and ask for prompt mode:
 
 ```text
-Use the gauntlet-loop skill to create an orchestration prompt for polishing this web app.
+Use the gauntlet-loop skill in prompt mode to create an orchestration prompt for polishing this web app.
 The bar is the supplied Figma design, passing tests, and no accessibility
 violations. Cap each workstream at three review passes.
 ```
 
-Exact invocation syntax depends on your host; consult its documentation for how it names and triggers installed skills. The skill returns a prompt you can review and run in a delegation-capable host. Better references produce better criticism: provide a design, test suite, rubric, example, or measurable definition of done when possible.
+Exact skill invocation syntax depends on your host. Better references produce better criticism: provide a design, test suite, rubric, example, or measurable definition of done when possible.
 
-## Design boundaries
+## Security and design boundaries
 
-Gauntlet Loop is intentionally a prompt skill, not a multi-provider protocol. It does not require an API key, background service, framework, or model vendor. Hosts differ in how they expose subagents and concurrency, so the generated prompt describes roles and evidence without depending on client-specific commands.
+Runtime mode is a deterministic local coordinator, not a background service or remote protocol. It relies on the authentication already configured in each CLI. Codex phases use its read-only or workspace-write sandbox; Claude phases use plan or accept-edits permissions. TFCode is read-only by default, and its `--auto` mode is reachable only through the explicit TFCode-worker opt-in. These controls reduce risk but do not make model-generated commands intrinsically safe: use a clean branch or worktree and review the resulting diff.
+
+The runner is sequential and repository-scoped. It hands text artifacts and the shared working tree between fresh client invocations; it does not transfer proprietary session state, hidden reasoning, account credentials, or conversations. It deliberately does not run independent writers concurrently against the same checkout.
 
 Repeated review can consume substantial time and tokens. The skill defaults to three worker/critic passes and requires unresolved failures to be surfaced rather than hidden behind an endless loop.
 
@@ -101,7 +142,7 @@ Issues and focused pull requests are welcome. Keep the core skill client-neutral
 bash scripts/validate.sh
 ```
 
-This runs shell syntax checks, `SKILL.md` frontmatter checks, and clean end-to-end link/copy installs (including conflict and foreign-symlink safety checks) against disposable temp directories — it makes no network calls and never touches your real skill directories. The same script runs in CI on every push and pull request.
+This runs shell/Python syntax checks, `SKILL.md` frontmatter checks, clean end-to-end link/copy installs, and fake-client routing tests proving when TFCode is and is not launched. It uses disposable temp directories, makes no network calls, and never touches your real skill directories. The same script runs in CI on every push and pull request.
 
 By contributing, you agree that your contributions are licensed under the MIT License.
 
