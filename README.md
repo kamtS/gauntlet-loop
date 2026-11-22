@@ -126,7 +126,18 @@ Exact skill invocation syntax depends on your host. Better references produce be
 
 ## Security and design boundaries
 
-Runtime mode is a deterministic local coordinator, not a background service or remote protocol. It relies on the authentication already configured in each CLI. Codex phases use its read-only or workspace-write sandbox; Claude phases use plan or accept-edits permissions. TFCode is read-only by default, and its `--auto` mode is reachable only through the explicit TFCode-worker opt-in. These controls reduce risk but do not make model-generated commands intrinsically safe: use a clean branch or worktree and review the resulting diff.
+Runtime mode coordinates local CLIs and relies on their existing authentication. Codex phases use its read-only or workspace-write sandbox. Read-only Claude phases use plan mode. TFCode is read-only by default, and its `--auto` mode requires explicit worker opt-in.
+
+The Claude worker uses `acceptEdits` with a required Bash sandbox. It can edit the project, read the current run artifacts (including under an external `run_root`), and run approved build and test commands such as `npm install`, `npm test`, `make`, and `pytest`. npm uses a workspace cache at `.gauntlet/npm-cache`. Use a Claude Code version with `--restricted` and `--permission-prompts` on a platform with a working Claude sandbox. The worker starts with restricted tools and answers permission prompts with an automatic denial.
+
+The Claude worker's deny rules cover:
+
+- Git pushes and force flags.
+- Direct recursive forced deletion. The shell sandbox also limits writes outside the workspace to Claude Code's sandbox temp space and protects the current run artifacts from edits.
+- Common deploy and credential CLIs, including AWS, Azure, Fly, Google Cloud, Helm, kubectl, Netlify, Terraform, OpenTofu, Vercel, Wrangler, 1Password, and macOS `security`. Direct npm deploy and publish commands, npm dist-tag changes, Maven deploy, and Gradle publish are also denied. The Bash network allowlist permits the public npm registry on port 443.
+- Reads of `~/.ssh`, common home credential and client configuration directories, and project `.env`, `.npmrc`, `.netrc`, `secrets/`, `.pem`, and `.key` paths. The sandbox removes inherited variables whose names indicate credentials before running build commands.
+
+Use a trusted checkout. Build tools can execute repository and dependency code inside the sandbox, and the file rules cover named secret locations. Keep other secrets outside the project and run directory.
 
 The runner is sequential and repository-scoped. It hands text artifacts and the shared working tree between fresh client invocations; it does not transfer proprietary session state, hidden reasoning, account credentials, or conversations. It deliberately does not run independent writers concurrently against the same checkout.
 
