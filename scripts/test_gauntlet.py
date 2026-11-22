@@ -27,6 +27,9 @@ if runtime == "tfcode" and sys.argv:
     prompt = sys.argv[-1]
 with open(os.environ["GAUNTLET_TEST_LOG"], "a", encoding="utf-8") as handle:
     handle.write(runtime + "\n")
+if runtime == "claude":
+    with open(os.environ["GAUNTLET_TEST_LOG"] + ".claude", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(sys.argv[1:]) + "\n")
 is_critic = "INDEPENDENT CRITIC" in prompt
 if os.environ.get("GAUNTLET_TEST_MUTATE_READONLY") == "1" and "PLANNER (READ ONLY)" in prompt:
     pathlib.Path("tracked.txt").write_text("mutated\n", encoding="utf-8")
@@ -193,6 +196,56 @@ class GauntletRunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         worker_line = next(line for line in result.stdout.splitlines() if line.startswith("worker"))
         self.assertIn("--auto", worker_line)
+
+    def test_claude_worker_uses_sandbox_and_read_only_artifact_access(self):
+        route = {"planner": "claude", "worker": "claude", "critic": "codex", "integrator": "claude"}
+        env = dict(self.env, GAUNTLET_TEST_SECRET="synthetic")
+        for run_root in (self.project / ".gauntlet" / "runs", self.root / "external artifacts"):
+            with self.subTest(run_root=run_root):
+                call_log = self.log.with_suffix(".log.claude")
+                call_log.unlink(missing_ok=True)
+                result = self.execute("run", self.config(route=route, run_root=str(run_root)), env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                planner, worker, integrator = [json.loads(line) for line in call_log.read_text().splitlines()]
+                run_dir, = run_root.resolve().iterdir()
+
+                for readonly in (planner, integrator):
+                    self.assertEqual(readonly[readonly.index("--permission-mode") + 1], "plan")
+                    for flag in ("--settings", "--tools", "--allowedTools", "--restricted", "--add-dir"):
+                        self.assertNotIn(flag, readonly)
+
+                self.assertEqual(worker[worker.index("--permission-mode") + 1], "acceptEdits")
+                self.assertEqual(worker[worker.index("--permission-prompts") + 1], "none")
+                self.assertIn("--restricted", worker)
+                self.assertIn("--strict-mcp-config", worker)
+                self.assertEqual(worker[worker.index("--tools") + 1], "Bash,Read,Glob,Grep,Edit,Write")
+                allowed = worker[worker.index("--allowedTools") + 1 : worker.index("--settings")]
+                self.assertIn("Bash(npm install *)", allowed)
+                self.assertIn("Bash(npm test *)", allowed)
+                self.assertNotIn("Bash", allowed)
+                if run_root.is_relative_to(self.project):
+                    self.assertNotIn("--add-dir", worker)
+                else:
+                    self.assertEqual(worker[worker.index("--add-dir") + 1], str(run_dir))
+
+                settings = json.loads(worker[worker.index("--settings") + 1])
+                sandbox = settings["sandbox"]
+                self.assertTrue(sandbox["enabled"])
+                self.assertTrue(sandbox["failIfUnavailable"])
+                self.assertFalse(sandbox["autoAllowBashIfSandboxed"])
+                self.assertFalse(sandbox["allowUnsandboxedCommands"])
+                self.assertTrue(settings["permissions"]["blockReadsOutsideWorkingDirectories"])
+                self.assertEqual(sandbox["filesystem"]["denyWrite"], [str(run_dir)])
+                self.assertEqual(
+                    sandbox["network"], {"allowedDomains": ["registry.npmjs.org:443"], "strictAllowlist": True}
+                )
+                self.assertIn({"name": "GAUNTLET_TEST_SECRET", "mode": "deny"}, sandbox["credentials"]["envVars"])
+                for rule in (
+                    "Bash(git push *)", "Bash(git * --force*)", "Bash(rm -rf*)",
+                    "Bash(wrangler *)", "Bash(npm publish *)", "Read(~/.ssh)",
+                    f"Read(/{self.project.resolve()}/**/.env)", f"Edit(/{run_dir}/**)",
+                ):
+                    self.assertIn(rule, settings["permissions"]["deny"])
 
     def status(self):
         status_files = list((self.project / ".gauntlet" / "runs").glob("*/status.json"))

@@ -150,11 +150,91 @@ def binary_for(runtime: str) -> str:
     return override or runtime
 
 
+def claude_worker_options(project_dir: pathlib.Path, run_dir: pathlib.Path) -> list[str]:
+    secret_paths = [
+        "~/.ssh",
+        "~/.aws",
+        "~/.kube",
+        "~/.azure",
+        "~/.docker",
+        "~/.config",
+        "~/.claude",
+        "~/.claude.json",
+        "~/.codex",
+        "~/Library/Keychains",
+        *(str(project_dir / pattern) for pattern in (
+            "**/.env", "**/.env.*", "**/.npmrc", "**/.netrc", "**/secrets", "**/*.pem", "**/*.key",
+        )),
+        "~/.npmrc",
+        "~/.netrc",
+        "~/.git-credentials",
+        "~/.gitconfig",
+    ]
+    blocked_commands = [
+        "git push *", "git * push *", "git * --force*", "git * -f", "git * -f *",
+        "rm -rf*", "rm -fr*", "rm * -r* -f*", "rm * -f* -r*",
+        "rm --recursive* --force*", "rm --force* --recursive*",
+        "npm publish *", "npm dist-tag *", "npm run deploy*", "npm run publish*",
+        "mvn *deploy*", "gradle *publish*", "./gradlew *publish*",
+        *(f"{tool} *" for tool in (
+            "aws", "az", "fly", "flyctl", "gcloud", "helm", "kubectl", "netlify",
+            "terraform", "tofu", "vercel", "wrangler", "op", "security",
+        )),
+    ]
+    denied = [
+        *(f"Bash({rule})" for rule in blocked_commands),
+        *(f"Read({path if path.startswith('~') else '/' + path})" for path in secret_paths),
+        f"Edit(/{run_dir}/**)",
+    ]
+    # Keep CLI authentication available to Claude itself while hiding inherited
+    # credentials from build scripts and their subprocesses.
+    credential_pattern = re.compile(
+        r"TOKEN|SECRET|PASSWORD|PASSPHRASE|AUTH|(?:API|ACCESS|PRIVATE)_KEY|CREDENTIAL|^SSH_|DATABASE_URL",
+        re.I,
+    )
+    credential_names = sorted(
+        name for name in os.environ
+        if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name)
+        and credential_pattern.search(name)
+    )
+    settings = {
+        "env": {"npm_config_cache": str(project_dir / ".gauntlet" / "npm-cache")},
+        "permissions": {"deny": denied, "blockReadsOutsideWorkingDirectories": True},
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "autoAllowBashIfSandboxed": False,
+            "allowUnsandboxedCommands": False,
+            "filesystem": {"denyWrite": [str(run_dir)]},
+            "network": {"allowedDomains": ["registry.npmjs.org:443"], "strictAllowlist": True},
+            "credentials": {"envVars": [{"name": name, "mode": "deny"} for name in credential_names]},
+        },
+    }
+    options = [
+        "--restricted", "--strict-mcp-config", "--no-chrome", "--permission-prompts", "none",
+        "--tools", "Bash,Read,Glob,Grep,Edit,Write",
+        "--allowedTools",
+        *(f"Bash({command} *)" for command in (
+            "npm install", "npm ci", "npm test", "npm run",
+            "make", "cmake", "ctest", "pytest", "python -m pytest", "python3 -m pytest",
+            "go build", "go test", "cargo build", "cargo test", "cargo check",
+            "dotnet build", "dotnet test", "gradle", "./gradlew", "mvn",
+        )),
+        "--settings", json.dumps(settings),
+    ]
+    if not run_dir.is_relative_to(project_dir):
+        options.extend(["--add-dir", str(run_dir)])
+    return options
+
+
 def command_for(
     runtime: str,
     phase: str,
     model: str | None,
     output_file: pathlib.Path | None = None,
+    *,
+    project_dir: pathlib.Path,
+    run_dir: pathlib.Path,
 ) -> tuple[list[str], bool]:
     writable = phase == "worker"
     binary = binary_for(runtime)
@@ -172,6 +252,8 @@ def command_for(
         return command, True
     if runtime == "claude":
         command = [binary, "-p", "--no-session-persistence", "--output-format", "text"]
+        if writable:
+            command.extend(claude_worker_options(project_dir, run_dir))
         command.extend(["--permission-mode", "acceptEdits" if writable else "plan"])
         if model:
             command.extend(["--model", model])
@@ -266,7 +348,11 @@ def invoke_phase(
     dry_run: bool,
 ) -> PhaseResult:
     runtime = config.route[phase]
-    command, use_stdin = command_for(runtime, phase, config.models.get(runtime), artifact if runtime == "codex" else None)
+    command, use_stdin = command_for(
+        runtime, phase, config.models.get(runtime),
+        artifact if runtime == "codex" else None,
+        project_dir=config.project_dir, run_dir=artifact.parent,
+    )
     if dry_run:
         print(f"{phase:10} {runtime:7} {display_command(command, use_stdin)}")
         return PhaseResult("", "")
@@ -372,7 +458,7 @@ def run(config: Config, *, dry_run: bool) -> pathlib.Path | None:
     if dry_run:
         print("Resolved Gauntlet route (no clients launched):")
         for phase in PHASES:
-            output = pathlib.Path("<run-dir>") / f"{phase}.md"
+            output = config.run_root / "<run-id>" / f"{phase}.md"
             invoke(config, phase, "", output, dry_run=True)
         print(f"max passes: {config.max_passes}")
         print(f"critic retries on unparseable verdict: {config.critic_retries}")
@@ -416,6 +502,7 @@ ROLE: WORKER (WRITE ENABLED), PASS {pass_number} OF {config.max_passes}
 Read the plan at {plan_path}.
 The previous critic report is included below. Implement or revise the task in the project repository.
 Preserve unrelated user changes. Run appropriate verification and report changed files, commands, and results.
+Return that report in your final response. The runner records it in the run directory.
 
 PREVIOUS CRITIC REPORT
 {critic_output}
