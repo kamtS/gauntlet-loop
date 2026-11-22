@@ -4,10 +4,12 @@ import importlib.util
 import json
 import os
 import pathlib
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -20,6 +22,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 runtime = pathlib.Path(sys.argv[0]).name
 prompt = sys.stdin.read() if not sys.stdin.isatty() else ""
@@ -27,6 +30,17 @@ if runtime == "tfcode" and sys.argv:
     prompt = sys.argv[-1]
 with open(os.environ["GAUNTLET_TEST_LOG"], "a", encoding="utf-8") as handle:
     handle.write(runtime + "\n")
+# A stuck worker: write a partial line, then hold both pipes open forever.
+if os.environ.get("GAUNTLET_TEST_HOLD_PIPES") == "1" and "ROLE: WORKER" in prompt:
+    pid_path = os.environ.get("GAUNTLET_TEST_HOLD_PID")
+    if pid_path:
+        pathlib.Path(pid_path).write_text(str(os.getpid()), encoding="utf-8")
+    sys.stdout.write("partial before hang\n")
+    sys.stdout.flush()
+    sys.stderr.write("err partial\n")
+    sys.stderr.flush()
+    while True:
+        time.sleep(3600)
 if runtime == "claude":
     with open(os.environ["GAUNTLET_TEST_LOG"] + ".claude", "a", encoding="utf-8") as handle:
         handle.write(json.dumps(sys.argv[1:]) + "\n")
@@ -128,7 +142,7 @@ class GauntletRunnerTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
-    def execute(self, command, config, env=None):
+    def execute(self, command, config, env=None, timeout=None):
         return subprocess.run(
             [sys.executable, str(RUNNER), command, str(config)],
             text=True,
@@ -136,6 +150,7 @@ class GauntletRunnerTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=env or self.env,
             check=False,
+            timeout=timeout,
         )
 
     def calls(self):
@@ -159,6 +174,7 @@ class GauntletRunnerTests(unittest.TestCase):
         result = self.execute("route", self.config())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TFCode used: critic", result.stdout)
+        self.assertIn("pipe drain timeout: 1800s", result.stdout)
         self.assertEqual(self.calls(), [])
 
     def test_tfcode_worker_requires_explicit_write_opt_in(self):
@@ -315,6 +331,68 @@ class GauntletRunnerTests(unittest.TestCase):
         result = self.run_with_verdicts("EARLY")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.status()["critic_verdict"], "PASS")
+
+    def _process_state(self, pid):
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.stdout.strip()
+
+    def _stop_held_child(self, pid_file):
+        if not pid_file.exists():
+            return
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8"))
+        except ValueError:
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+    def test_pipe_drain_timeout_must_be_positive(self):
+        for value in (0, -5, True):
+            with self.subTest(value=value):
+                result = self.execute("route", self.config(pipe_drain_timeout_seconds=value))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("pipe_drain_timeout_seconds", result.stderr)
+
+    def test_stuck_child_pipe_drain_is_bounded_and_recorded(self):
+        pid_file = self.root / "hold.pid"
+        self.addCleanup(lambda: self._stop_held_child(pid_file))
+        env = dict(self.env)
+        env["GAUNTLET_TEST_HOLD_PIPES"] = "1"
+        env["GAUNTLET_TEST_HOLD_PID"] = str(pid_file)
+        started = time.monotonic()
+        try:
+            result = self.execute(
+                "run",
+                self.config(pipe_drain_timeout_seconds=1),
+                env=env,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("runner hung instead of bounding the pipe drain")
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertIn("worker (codex)", result.stderr)
+        self.assertIn("timed out draining stdout and stderr", result.stderr)
+        self.assertEqual(self.calls(), ["claude", "codex"])
+        self.assertTrue(pid_file.exists(), "stuck child never recorded its pid")
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        self.assertEqual(self._process_state(pid), "")
+        status = self.status()
+        self.assertEqual(status["outcome"], "pipe_drain_timeout")
+        self.assertEqual(status["phase"], "worker")
+        self.assertEqual(status["runtime"], "codex")
+        worker = next((self.project / ".gauntlet" / "runs").glob("*/*worker*.md"))
+        self.assertIn("partial before hang", worker.read_text(encoding="utf-8"))
+        drain_log = worker.with_name(worker.stem + ".pipe-drain.log")
+        self.assertIn("err partial", drain_log.read_text(encoding="utf-8"))
 
     def test_tfcode_dropped_lines_are_surfaced(self):
         result = self.run_with_verdicts("GARBAGE", critic_retries=0)

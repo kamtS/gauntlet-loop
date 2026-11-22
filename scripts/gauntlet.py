@@ -6,14 +6,19 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, IO
 
 
 RUNTIMES = ("claude", "codex", "tfcode")
@@ -26,7 +31,12 @@ VERDICT_FAIL = "FAIL"
 VERDICT_UNPARSEABLE = "UNPARSEABLE"
 EXIT_PASS_LIMIT = 3
 EXIT_UNPARSEABLE = 4
+# A phase, or a descendant that inherited its pipes, never closed stdout/stderr.
+EXIT_PIPE_DRAIN = 5
 DEFAULT_CRITIC_RETRIES = 1
+# Long enough for a real client phase, short enough that a stuck pipe cannot
+# hold the runner open for the rest of the session.
+DEFAULT_PIPE_DRAIN_TIMEOUT_SECONDS = 1800
 DEFAULT_ROUTE = {
     "planner": "claude",
     "worker": "codex",
@@ -37,6 +47,10 @@ DEFAULT_ROUTE = {
 
 class ConfigError(ValueError):
     pass
+
+
+class PipeDrainTimeout(Exception):
+    """A phase kept stdout or stderr open until the drain bound."""
 
 
 @dataclass(frozen=True)
@@ -51,6 +65,7 @@ class Config:
     allow_tfcode_write: bool
     run_root: pathlib.Path
     critic_retries: int = DEFAULT_CRITIC_RETRIES
+    pipe_drain_timeout_seconds: float = DEFAULT_PIPE_DRAIN_TIMEOUT_SECONDS
 
 
 def read_config(path: pathlib.Path) -> Config:
@@ -127,6 +142,18 @@ def read_config(path: pathlib.Path) -> Config:
     ):
         raise ConfigError("critic_retries must be an integer from 0 to 3")
 
+    pipe_drain_timeout_seconds = raw.get(
+        "pipe_drain_timeout_seconds", DEFAULT_PIPE_DRAIN_TIMEOUT_SECONDS
+    )
+    if (
+        isinstance(pipe_drain_timeout_seconds, bool)
+        or not isinstance(pipe_drain_timeout_seconds, (int, float))
+        or not math.isfinite(pipe_drain_timeout_seconds)
+        or pipe_drain_timeout_seconds <= 0
+    ):
+        raise ConfigError("pipe_drain_timeout_seconds must be a positive number of seconds")
+    pipe_drain_timeout_seconds = float(pipe_drain_timeout_seconds)
+
     run_root = pathlib.Path(raw.get("run_root", ".gauntlet/runs"))
     if not run_root.is_absolute():
         run_root = project_dir / run_root
@@ -142,6 +169,7 @@ def read_config(path: pathlib.Path) -> Config:
         allow_tfcode_write=allow_tfcode_write,
         run_root=run_root.resolve(),
         critic_retries=critic_retries,
+        pipe_drain_timeout_seconds=pipe_drain_timeout_seconds,
     )
 
 
@@ -328,6 +356,136 @@ class PhaseResult:
     transcript: str
 
 
+def _close_stream(stream: IO[bytes] | None) -> None:
+    if stream is None or stream.closed:
+        return
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _feed_stdin(stdin: IO[bytes], payload: bytes) -> None:
+    try:
+        if payload:
+            stdin.write(payload)
+            try:
+                stdin.flush()
+            except OSError:
+                pass
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        _close_stream(stdin)
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Stop the child and any descendant that stayed in its session."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            return
+
+
+def run_client(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    prompt: str | None,
+    timeout: float,
+) -> tuple[int, str, str, bool]:
+    """Run a client and drain both pipes until EOF or `timeout` seconds.
+
+    `subprocess.run` waits for EOF with no bound, so a child (or a descendant
+    that inherited the pipes) can stall the runner forever. On timeout the
+    process group is killed; if it cannot be reaped the pipes are closed and
+    the child is abandoned. Partial output captured before the bound is kept.
+    """
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    feeder = None
+    if prompt is not None and proc.stdin is not None:
+        feeder = threading.Thread(
+            target=_feed_stdin,
+            args=(proc.stdin, prompt.encode("utf-8")),
+            daemon=True,
+        )
+        feeder.start()
+
+    stdout_pipe = proc.stdout
+    stderr_pipe = proc.stderr
+    if stdout_pipe is None or stderr_pipe is None:
+        raise RuntimeError("phase stdout and stderr were not captured")
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    streams: dict[int, tuple[IO[bytes], list[bytes]]] = {
+        stdout_pipe.fileno(): (stdout_pipe, stdout_chunks),
+        stderr_pipe.fileno(): (stderr_pipe, stderr_chunks),
+    }
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        while streams or proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if not streams:
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                break
+            readable, _, _ = select.select(list(streams), [], [], min(remaining, 0.25))
+            if not readable:
+                continue
+            for fd in readable:
+                stream, chunks = streams[fd]
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    data = b""
+                if data:
+                    chunks.append(data)
+                    continue
+                streams.pop(fd, None)
+                _close_stream(stream)
+        if timed_out:
+            _kill_process_group(proc)
+            for stream, _chunks in list(streams.values()):
+                _close_stream(stream)
+            streams.clear()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                # Still alive after SIGKILL (for example uninterruptible sleep).
+                # The pipes are already closed, so the runner does not wait.
+                pass
+    finally:
+        if feeder is not None:
+            feeder.join(timeout=1)
+        _close_stream(proc.stdout)
+        _close_stream(proc.stderr)
+
+    stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+    stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+    returncode = proc.returncode if proc.returncode is not None else 1
+    return returncode, stdout, stderr, timed_out
+
+
 def invoke(
     config: Config,
     phase: str,
@@ -364,21 +522,44 @@ def invoke_phase(
     artifact.touch(exist_ok=True)
     before = git_state(config.project_dir) if phase != "worker" else None
     run_command = command if use_stdin else [*command, prompt]
-    result = subprocess.run(
+    # Clients that take the prompt as an argument get no stdin pipe: an
+    # inherited open stdin can block a client forever. `prompt is None` selects
+    # that path inside run_client.
+    returncode, stdout, stderr, timed_out = run_client(
         run_command,
         cwd=config.project_dir,
-        input=prompt if use_stdin else None,
-        # Clients that take the prompt as an argument must not inherit the
-        # caller's stdin: an open pipe there can block a client forever.
-        stdin=None if use_stdin else subprocess.DEVNULL,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+        prompt=prompt if use_stdin else None,
+        timeout=config.pipe_drain_timeout_seconds,
     )
-    if result.returncode != 0:
+    if timed_out:
+        partial = stdout.strip()
+        artifact.write_text((partial + "\n") if partial else "", encoding="utf-8")
+        drain_log = artifact.with_name(artifact.stem + ".pipe-drain.log")
+        drain_log.write_text(
+            "pipe drain timed out after "
+            f"{config.pipe_drain_timeout_seconds:g}s\n"
+            f"--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            encoding="utf-8",
+        )
+        status = {
+            "outcome": "pipe_drain_timeout",
+            "phase": phase,
+            "runtime": runtime,
+            "pipe_drain_timeout_seconds": config.pipe_drain_timeout_seconds,
+            "partial_output": str(artifact),
+            "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        (artifact.parent / "status.json").write_text(
+            json.dumps(status, indent=2) + "\n", encoding="utf-8"
+        )
+        raise PipeDrainTimeout(
+            f"{phase} ({runtime}) timed out draining stdout and stderr after "
+            f"{config.pipe_drain_timeout_seconds:g}s; the child was killed or abandoned "
+            f"and partial output was kept in {artifact}"
+        )
+    if returncode != 0:
         raise RuntimeError(
-            f"{phase} ({runtime}) failed with exit {result.returncode}:\n{result.stderr.strip()}"
+            f"{phase} ({runtime}) failed with exit {returncode}:\n{stderr.strip()}"
         )
     dropped: list[str] = []
     if runtime == "codex":
@@ -387,14 +568,14 @@ def invoke_phase(
         # fall back to stdout instead of silently scoring an empty string.
         output = artifact.read_text(encoding="utf-8").strip() if artifact.exists() else ""
         if not output:
-            output = result.stdout.strip()
+            output = stdout.strip()
         # Codex streams earlier agent messages on stderr and stdout.
-        transcript = "\n".join(part for part in (result.stderr, result.stdout, output) if part)
+        transcript = "\n".join(part for part in (stderr, stdout, output) if part)
     elif runtime == "tfcode":
-        output, dropped = parse_tfcode_events(result.stdout)
+        output, dropped = parse_tfcode_events(stdout)
         transcript = output
     else:
-        output = result.stdout.strip()
+        output = stdout.strip()
         transcript = output
     artifact.write_text(output + "\n", encoding="utf-8")
 
@@ -462,6 +643,7 @@ def run(config: Config, *, dry_run: bool) -> pathlib.Path | None:
             invoke(config, phase, "", output, dry_run=True)
         print(f"max passes: {config.max_passes}")
         print(f"critic retries on unparseable verdict: {config.critic_retries}")
+        print(f"pipe drain timeout: {config.pipe_drain_timeout_seconds:g}s")
         print("TFCode used: " + ", ".join(p for p in PHASES if config.route[p] == "tfcode") if "tfcode" in config.route.values() else "TFCode used: never")
         return None
 
@@ -477,6 +659,7 @@ def run(config: Config, *, dry_run: bool) -> pathlib.Path | None:
         "models": config.models,
         "allow_tfcode_write": config.allow_tfcode_write,
         "critic_retries": config.critic_retries,
+        "pipe_drain_timeout_seconds": config.pipe_drain_timeout_seconds,
     }
     (run_dir / "config.json").write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
     context = common_context(config, run_dir)
@@ -598,6 +781,9 @@ def main() -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    except PipeDrainTimeout as exc:
+        print(f"run error: {exc}", file=sys.stderr)
+        return EXIT_PIPE_DRAIN
     except RuntimeError as exc:
         print(f"run error: {exc}", file=sys.stderr)
         return 1
