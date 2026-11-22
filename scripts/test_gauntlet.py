@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -443,6 +445,193 @@ class VerdictParsingTests(unittest.TestCase):
         text, dropped = self.gauntlet.parse_tfcode_events(stdout)
         self.assertEqual(text, "hello")
         self.assertEqual(dropped, ["not json", "[1, 2]"])
+
+
+# Values whose legal set is part of the write/read permission contract.
+# Other flag values (tool lists, settings JSON, paths, model names) are not
+# expected to appear in --help.
+DOCUMENTED_FLAG_VALUES = {
+    "--permission-mode",
+    "--permission-prompts",
+    "--output-format",
+    "--sandbox",
+}
+
+
+def load_gauntlet():
+    loaded = sys.modules.get("gauntlet")
+    if loaded is not None and hasattr(loaded, "command_for"):
+        return loaded
+    spec = importlib.util.spec_from_file_location("gauntlet", RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def cli_help(binary, args):
+    """Return combined stdout and stderr from a local --help invocation."""
+    result = subprocess.run(
+        [binary, *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    text = f"{result.stdout or ''}\n{result.stderr or ''}"
+    if result.returncode != 0 or not text.strip():
+        name = pathlib.Path(binary).name
+        raise AssertionError(
+            f"{name} {' '.join(args)} exited {result.returncode} without usable help text"
+        )
+    return text
+
+
+def flag_pairs(argv):
+    """Return (flag, value) for options in argv. A bare '-' is the stdin marker."""
+    pairs = []
+    tokens = argv[1:]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-" or not token.startswith("-"):
+            index += 1
+            continue
+        value = None
+        if (
+            index + 1 < len(tokens)
+            and tokens[index + 1] != "-"
+            and not tokens[index + 1].startswith("-")
+        ):
+            value = tokens[index + 1]
+            index += 2
+        else:
+            index += 1
+        pairs.append((token, value))
+    return pairs
+
+
+def flag_map(argv):
+    found = {}
+    for flag, value in flag_pairs(argv):
+        found.setdefault(flag, []).append(value)
+    return found
+
+
+def assert_flags_documented(test, help_text, argv):
+    for flag, value in flag_pairs(argv):
+        matches = list(re.finditer(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", help_text))
+        test.assertTrue(matches, f"{flag} is not in the CLI help, so the real CLI may reject it")
+        if flag not in DOCUMENTED_FLAG_VALUES or value is None:
+            continue
+        documented = False
+        for match in matches:
+            window = help_text[match.start():match.start() + 900]
+            if (
+                f'"{value}"' in window
+                or f"'{value}'" in window
+                or re.search(rf"(?<![\w-]){re.escape(value)}(?![\w-])", window)
+            ):
+                documented = True
+                break
+        test.assertTrue(
+            documented,
+            f"{flag} value {value!r} is not documented beside that flag",
+        )
+
+
+class RealCliFlagContractTests(unittest.TestCase):
+    """The flags gauntlet.py passes are ones the real CLIs document.
+
+    Fake-binary tests still check which flags the runner selects. This contract
+    checks those flags against installed help text, and skips when a binary is
+    not on PATH. It only runs `--help`. It does not start a model session.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gauntlet = load_gauntlet()
+        cls._hidden_bins = {}
+        for key in ("GAUNTLET_CLAUDE_BIN", "GAUNTLET_CODEX_BIN", "GAUNTLET_TFCODE_BIN"):
+            if key in os.environ:
+                cls._hidden_bins[key] = os.environ.pop(key)
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.update(cls._hidden_bins)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = pathlib.Path(self.tmp.name)
+        self.project = root / "project"
+        self.inside = self.project / ".gauntlet" / "runs" / "example"
+        self.outside = root / "external"
+        self.output = self.inside / "last.txt"
+
+    def command(self, runtime, phase, model=None, output_file=None, run_dir=None):
+        command, _stdin = self.gauntlet.command_for(
+            runtime,
+            phase,
+            model,
+            output_file,
+            project_dir=self.project,
+            run_dir=run_dir or self.inside,
+        )
+        return command
+
+    def test_claude_permission_flags_are_in_claude_help(self):
+        binary = shutil.which("claude")
+        if binary is None:
+            self.skipTest(
+                "claude is not on PATH; skipping the real CLI flag contract. "
+                "Fake-binary tests still cover which flags the runner passes."
+            )
+        help_text = cli_help(binary, ["--help"])
+        worker = self.command("claude", "worker", model="sonnet")
+        worker_outside = self.command("claude", "worker", run_dir=self.outside)
+        planner = self.command("claude", "planner")
+        worker_flags = flag_map(worker)
+        planner_flags = flag_map(planner)
+        self.assertEqual(worker_flags["--permission-mode"], ["acceptEdits"])
+        self.assertEqual(worker_flags["--permission-prompts"], ["none"])
+        self.assertIn("--restricted", worker_flags)
+        self.assertEqual(worker_flags["--model"], ["sonnet"])
+        self.assertIn("--add-dir", flag_map(worker_outside))
+        self.assertEqual(planner_flags["--permission-mode"], ["plan"])
+        self.assertEqual(planner_flags["-p"], [None])
+        for absent in ("--restricted", "--settings", "--allowedTools", "--tools", "--permission-prompts"):
+            self.assertNotIn(absent, planner_flags)
+        for command in (worker, worker_outside, planner):
+            assert_flags_documented(self, help_text, command)
+
+    def test_codex_permission_flags_are_in_codex_help(self):
+        binary = shutil.which("codex")
+        if binary is None:
+            self.skipTest(
+                "codex is not on PATH; skipping the real CLI flag contract. "
+                "Fake-binary tests still cover which flags the runner passes."
+            )
+        top_level = cli_help(binary, ["--help"])
+        # `codex exec` flags such as --ephemeral and --output-last-message are
+        # documented by the subcommand help. `codex --help` lists the subcommand.
+        self.assertRegex(top_level, r"(?<![\w-])exec(?![\w-])")
+        exec_help = cli_help(binary, ["exec", "--help"])
+        help_text = top_level + "\n" + exec_help
+        worker = self.command("codex", "worker", model="example-model", output_file=self.output)
+        critic = self.command("codex", "critic", output_file=self.output)
+        worker_flags = flag_map(worker)
+        critic_flags = flag_map(critic)
+        self.assertEqual(worker_flags["--approve-for-me"], [None])
+        self.assertNotIn("--sandbox", worker_flags)
+        self.assertEqual(worker_flags["--ephemeral"], [None])
+        self.assertEqual(worker_flags["--output-last-message"], [str(self.output)])
+        self.assertEqual(critic_flags["--sandbox"], ["read-only"])
+        self.assertNotIn("--approve-for-me", critic_flags)
+        for command in (worker, critic):
+            self.assertEqual(command[1], "exec")
+            assert_flags_documented(self, help_text, command)
 
 
 if __name__ == "__main__":
