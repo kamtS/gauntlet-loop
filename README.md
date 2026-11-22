@@ -110,7 +110,7 @@ A critic run that produces no `VERDICT: PASS` or `VERDICT: FAIL` line — an emp
 
 Binary paths can be overridden with `GAUNTLET_CLAUDE_BIN`, `GAUNTLET_CODEX_BIN`, and `GAUNTLET_TFCODE_BIN`. Optional client models belong in a `models` object keyed by runtime. Relative config paths resolve from the config file's directory.
 
-Client invocations can consume substantial tokens and may incur provider charges. `route` and `doctor` do not invoke a model; `run` does. Review the resolved route before each live run.
+Client invocations can consume substantial tokens and may incur provider charges. `route` and `doctor` do not invoke a model; `run` does. Check the resolved route against the user's authorization before each live run. Authorization for an external critic covers retries and rechecks within the agreed runtime, scope, and pass limit. Ask again if the review would go beyond that authorization, and honor any permission prompt from the client.
 
 ## Prompt-only use
 

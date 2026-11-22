@@ -17,6 +17,8 @@ Use prompt mode when the user asks for a prompt, template, or plan, or when live
 
 Before runtime mode, state the resolved route and pass limit. The user controls TFCode by assigning it to one or more phases. If no phase maps to `tfcode`, the runner does not launch it.
 
+An authorized external critic review can proceed for the agreed runtime, scope, and pass limit, including retries and rechecks within that scope. Ask for approval if the review would go beyond that authorization, and honor any permission prompt from the client.
+
 ## Configure runtime mode
 
 Create a JSON file outside the installed skill or in the target project:
