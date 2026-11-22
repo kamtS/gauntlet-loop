@@ -18,6 +18,15 @@ from typing import Any
 
 RUNTIMES = ("claude", "codex", "tfcode")
 PHASES = ("planner", "worker", "critic", "integrator")
+VERDICT_PASS = "PASS"
+VERDICT_FAIL = "FAIL"
+# The critic returned no usable verdict line: an empty artifact, a truncated or
+# dead transcript, or tool narration that never ruled. This is not a FAIL and
+# must not be fed back to the worker as if it were one.
+VERDICT_UNPARSEABLE = "UNPARSEABLE"
+EXIT_PASS_LIMIT = 3
+EXIT_UNPARSEABLE = 4
+DEFAULT_CRITIC_RETRIES = 1
 DEFAULT_ROUTE = {
     "planner": "claude",
     "worker": "codex",
@@ -41,6 +50,7 @@ class Config:
     models: dict[str, str]
     allow_tfcode_write: bool
     run_root: pathlib.Path
+    critic_retries: int = DEFAULT_CRITIC_RETRIES
 
 
 def read_config(path: pathlib.Path) -> Config:
@@ -109,6 +119,14 @@ def read_config(path: pathlib.Path) -> Config:
             "TFCode worker mode requires allow_tfcode_write: true because it invokes tfcode --auto"
         )
 
+    critic_retries = raw.get("critic_retries", DEFAULT_CRITIC_RETRIES)
+    if (
+        not isinstance(critic_retries, int)
+        or isinstance(critic_retries, bool)
+        or not 0 <= critic_retries <= 3
+    ):
+        raise ConfigError("critic_retries must be an integer from 0 to 3")
+
     run_root = pathlib.Path(raw.get("run_root", ".gauntlet/runs"))
     if not run_root.is_absolute():
         run_root = project_dir / run_root
@@ -123,6 +141,7 @@ def read_config(path: pathlib.Path) -> Config:
         models=models,
         allow_tfcode_write=allow_tfcode_write,
         run_root=run_root.resolve(),
+        critic_retries=critic_retries,
     )
 
 
@@ -182,21 +201,49 @@ def git_state(project_dir: pathlib.Path) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def tfcode_text(stdout: str) -> str:
+def parse_tfcode_events(stdout: str) -> tuple[str, list[str]]:
+    """Return TFCode's joined message text and every line that was not a JSON event.
+
+    Dropped lines are returned rather than silently discarded so the caller can
+    record them: a stream that is mostly unparseable is evidence of a dead or
+    truncated run, not of a verdict.
+    """
     pieces: list[str] = []
+    dropped: list[str] = []
     for line in stdout.splitlines():
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            dropped.append(line)
             continue
         if not isinstance(event, dict):
+            dropped.append(line)
             continue
         part = event.get("part")
         if isinstance(part, dict) and isinstance(part.get("text"), str):
             pieces.append(part["text"])
         elif isinstance(event.get("text"), str):
             pieces.append(event["text"])
-    return "\n".join(pieces).strip() or stdout.strip()
+    text = "\n".join(pieces).strip()
+    if not text and dropped:
+        # No structured text at all: keep the raw output visible rather than
+        # returning an empty string that hides what the client printed.
+        text = stdout.strip()
+    return text, dropped
+
+
+def tfcode_text(stdout: str) -> str:
+    return parse_tfcode_events(stdout)[0]
+
+
+@dataclass(frozen=True)
+class PhaseResult:
+    output: str
+    # Everything the client emitted, including earlier messages that the final
+    # output omits. Used to find a verdict the final message did not repeat.
+    transcript: str
 
 
 def invoke(
@@ -207,11 +254,22 @@ def invoke(
     *,
     dry_run: bool,
 ) -> str:
+    return invoke_phase(config, phase, prompt, artifact, dry_run=dry_run).output
+
+
+def invoke_phase(
+    config: Config,
+    phase: str,
+    prompt: str,
+    artifact: pathlib.Path,
+    *,
+    dry_run: bool,
+) -> PhaseResult:
     runtime = config.route[phase]
     command, use_stdin = command_for(runtime, phase, config.models.get(runtime), artifact if runtime == "codex" else None)
     if dry_run:
         print(f"{phase:10} {runtime:7} {display_command(command, use_stdin)}")
-        return ""
+        return PhaseResult("", "")
 
     # Make the expected audit artifact visible to Git before the read-only
     # snapshot. Rewriting an already-untracked artifact then leaves porcelain
@@ -224,6 +282,9 @@ def invoke(
         run_command,
         cwd=config.project_dir,
         input=prompt if use_stdin else None,
+        # Clients that take the prompt as an argument must not inherit the
+        # caller's stdin: an open pipe there can block a client forever.
+        stdin=None if use_stdin else subprocess.DEVNULL,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -233,12 +294,22 @@ def invoke(
         raise RuntimeError(
             f"{phase} ({runtime}) failed with exit {result.returncode}:\n{result.stderr.strip()}"
         )
-    if runtime == "codex" and artifact.exists():
-        output = artifact.read_text(encoding="utf-8").strip()
+    dropped: list[str] = []
+    if runtime == "codex":
+        # --output-last-message holds only the final message. The artifact was
+        # touched above, so an exit-0 run that never wrote it reads as empty;
+        # fall back to stdout instead of silently scoring an empty string.
+        output = artifact.read_text(encoding="utf-8").strip() if artifact.exists() else ""
+        if not output:
+            output = result.stdout.strip()
+        # Codex streams earlier agent messages on stderr and stdout.
+        transcript = "\n".join(part for part in (result.stderr, result.stdout, output) if part)
     elif runtime == "tfcode":
-        output = tfcode_text(result.stdout)
+        output, dropped = parse_tfcode_events(result.stdout)
+        transcript = output
     else:
         output = result.stdout.strip()
+        transcript = output
     artifact.write_text(output + "\n", encoding="utf-8")
 
     if phase != "worker" and before is not None:
@@ -247,7 +318,16 @@ def invoke(
             raise RuntimeError(
                 f"read-only {phase} ({runtime}) changed the repository; inspect {artifact} and restore deliberately"
             )
-    return output
+    # Written after the read-only guard so the audit file itself is not
+    # mistaken for a client edit.
+    if dropped:
+        dropped_path = artifact.with_name(artifact.stem + ".dropped.log")
+        dropped_path.write_text("\n".join(dropped) + "\n", encoding="utf-8")
+        print(
+            f"warning: {phase} ({runtime}) emitted {len(dropped)} non-JSON line(s); kept in {dropped_path}",
+            file=sys.stderr,
+        )
+    return PhaseResult(output, transcript)
 
 
 def common_context(config: Config, run_dir: pathlib.Path) -> str:
@@ -265,9 +345,27 @@ RUN ARTIFACTS
 """
 
 
+VERDICT_LINE = re.compile(r"(?im)^VERDICT:\s*(PASS|FAIL)\s*$")
+
+
 def verdict(text: str) -> str:
-    matches = re.findall(r"(?im)^VERDICT:\s*(PASS|FAIL)\s*$", text)
-    return matches[-1].upper() if matches else "FAIL"
+    """Return PASS, FAIL, or UNPARSEABLE for a critic transcript.
+
+    A missing verdict line is never treated as FAIL: an empty artifact or a
+    transcript cut off mid-sentence says nothing about the work under review.
+    """
+    if not text or not text.strip():
+        return VERDICT_UNPARSEABLE
+    matches = VERDICT_LINE.findall(text)
+    return matches[-1].upper() if matches else VERDICT_UNPARSEABLE
+
+
+def critic_verdict(result: PhaseResult) -> str:
+    """Prefer the verdict in the final output, then any earlier message."""
+    final = verdict(result.output)
+    if final != VERDICT_UNPARSEABLE:
+        return final
+    return verdict(result.transcript)
 
 
 def run(config: Config, *, dry_run: bool) -> pathlib.Path | None:
@@ -277,6 +375,7 @@ def run(config: Config, *, dry_run: bool) -> pathlib.Path | None:
             output = pathlib.Path("<run-dir>") / f"{phase}.md"
             invoke(config, phase, "", output, dry_run=True)
         print(f"max passes: {config.max_passes}")
+        print(f"critic retries on unparseable verdict: {config.critic_retries}")
         print("TFCode used: " + ", ".join(p for p in PHASES if config.route[p] == "tfcode") if "tfcode" in config.route.values() else "TFCode used: never")
         return None
 
@@ -291,6 +390,7 @@ def run(config: Config, *, dry_run: bool) -> pathlib.Path | None:
         "route": config.route,
         "models": config.models,
         "allow_tfcode_write": config.allow_tfcode_write,
+        "critic_retries": config.critic_retries,
     }
     (run_dir / "config.json").write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
     context = common_context(config, run_dir)
@@ -305,8 +405,9 @@ verification commands, and the smallest coherent implementation. Do not edit fil
     invoke(config, "planner", planner_prompt, plan_path, dry_run=False)
 
     critic_output = "No critique yet."
-    final_verdict = "FAIL"
+    final_verdict = VERDICT_FAIL
     completed_passes = 0
+    critic_attempts = 0
     for pass_number in range(1, config.max_passes + 1):
         completed_passes = pass_number
         worker_path = run_dir / f"{pass_number + 1:02d}-worker-pass-{pass_number}.md"
@@ -322,17 +423,30 @@ PREVIOUS CRITIC REPORT
         print(f"worker pass {pass_number}: {config.route['worker']}")
         invoke(config, "worker", worker_prompt, worker_path, dry_run=False)
 
-        critic_path = run_dir / f"{pass_number + 1:02d}-critic-pass-{pass_number}.md"
         critic_prompt = context + f"""
 ROLE: INDEPENDENT CRITIC (READ ONLY), PASS {pass_number} OF {config.max_passes}
 Inspect the actual repository and the worker report at {worker_path}. Try to disprove completion against the
 acceptance bar. Run read-only checks and tests where safe. Report concrete findings with evidence and required
 fixes. End with exactly one line: VERDICT: PASS or VERDICT: FAIL. Do not edit files.
 """
-        print(f"critic pass {pass_number}: {config.route['critic']}")
-        critic_output = invoke(config, "critic", critic_prompt, critic_path, dry_run=False)
-        final_verdict = verdict(critic_output)
-        if final_verdict == "PASS":
+        # An unparseable critic run is retried against the same worker output;
+        # it never consumes a worker pass or reaches the worker as a FAIL.
+        for attempt in range(config.critic_retries + 1):
+            suffix = f"-retry-{attempt}" if attempt else ""
+            critic_path = run_dir / f"{pass_number + 1:02d}-critic-pass-{pass_number}{suffix}.md"
+            label = f" (retry {attempt} after unparseable verdict)" if attempt else ""
+            print(f"critic pass {pass_number}: {config.route['critic']}{label}")
+            critic_attempts += 1
+            critic_result = invoke_phase(config, "critic", critic_prompt, critic_path, dry_run=False)
+            final_verdict = critic_verdict(critic_result)
+            if final_verdict != VERDICT_UNPARSEABLE:
+                break
+            print(
+                f"warning: critic pass {pass_number} produced no VERDICT line; see {critic_path}",
+                file=sys.stderr,
+            )
+        critic_output = critic_result.output
+        if final_verdict != VERDICT_FAIL:
             break
 
     integration_path = run_dir / "99-integration.md"
@@ -347,13 +461,21 @@ risks and unresolved findings. The critic's final verdict was {final_verdict} af
     status = {
         "critic_verdict": final_verdict,
         "passes": completed_passes,
+        "critic_attempts": critic_attempts,
         "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     (run_dir / "status.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
     print(f"run artifacts: {run_dir}")
-    if final_verdict != "PASS":
+    if final_verdict == VERDICT_UNPARSEABLE:
+        print(
+            "gauntlet stopped: the critic returned no parseable VERDICT line after "
+            f"{config.critic_retries + 1} attempt(s); inspect the critic artifacts before trusting or rerunning",
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_UNPARSEABLE)
+    if final_verdict != VERDICT_PASS:
         print("gauntlet stopped at its pass limit with unresolved findings", file=sys.stderr)
-        raise SystemExit(3)
+        raise SystemExit(EXIT_PASS_LIMIT)
     return run_dir
 
 

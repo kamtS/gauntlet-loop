@@ -106,6 +106,8 @@ python3 scripts/gauntlet.py run gauntlet.json
 
 The runner uses no shell interpolation. It invokes each local CLI as a subprocess, gives write permissions only to the worker phase, caps loops at five passes, and stores the config snapshot, phase prompts/responses, verdict, and final integration report under `<project>/.gauntlet/runs/`. Read-only phases are also guarded by a before/after Git-state check.
 
+A critic run that produces no `VERDICT: PASS` or `VERDICT: FAIL` line — an empty artifact, a transcript cut off mid-sentence, or tool narration that never ruled — is recorded as `UNPARSEABLE`, never as `FAIL`. The runner searches the whole critic transcript (including earlier Codex messages, not just `--output-last-message`), retries the critic against the same worker output up to `critic_retries` times (default `1`, range `0`–`3`) without consuming a worker pass, and otherwise stops with exit code `4` so you inspect the critic artifacts instead of burning builder passes. Non-JSON lines in TFCode's event stream are kept beside the artifact as `*.dropped.log`. Exit code `3` still means a genuine `FAIL` at the pass limit.
+
 Binary paths can be overridden with `GAUNTLET_CLAUDE_BIN`, `GAUNTLET_CODEX_BIN`, and `GAUNTLET_TFCODE_BIN`. Optional client models belong in a `models` object keyed by runtime. Relative config paths resolve from the config file's directory.
 
 Client invocations can consume substantial tokens and may incur provider charges. `route` and `doctor` do not invoke a model; `run` does. Review the resolved route before each live run.
